@@ -34,6 +34,10 @@ stays a future SmokeHouse phase with its trigger on record.
   effect — the same argument that makes Renderer's bootstrap and replication's overlap safe.
 - **Contract:** construct Twine (which replays) before any other post-reopen writes; one
   Twine, one in-flight batch — the single-writer discipline, one level up.
+- **The sink seam.** `Twine.over(PutSink, DeleteSink, …)` ties batches over ANY
+  last-writer-wins target — named by WholeHog, whose composed organism routes batches
+  through `indexed::put`/`indexed::delete` so secondary and interval indexes see every
+  batched write (tying over the primary would bypass them all).
 - **Honest bound:** atomic across crashes, not isolated from concurrent readers. Reader-
   visible atomicity needs log-format group commit — a future SmokeHouse phase, trigger on
   record.
@@ -56,6 +60,7 @@ composite builds:
 | **Twine** (this repo) | crash-atomic multi-key batches — journaled commit, idempotent replay |
 | [SmokeSignal](https://github.com/RicheyWorks/SmokeSignal) | the wire — a loopback protocol face for the store |
 | [Jerky](https://github.com/RicheyWorks/Jerky) | cold storage — compressed, CRC-verified backup archives |
+| [WholeHog](https://github.com/RicheyWorks/WholeHog) | the integration organism — all of them, at once |
 
 ## Build
 
