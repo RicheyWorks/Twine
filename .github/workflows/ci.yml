@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Twine composite-builds against ../SmokeHouse, which composite-builds against
+      # ../SuperBeefSort, which composite-builds against ../CSRBT — all four repos are
+      # checked out as siblings and Gradle runs from the Twine subdirectory.
+      - name: Check out Twine
+        uses: actions/checkout@v4
+        with:
+          path: Twine
+
+      - name: Check out SmokeHouse (sibling, for the composite build)
+        uses: actions/checkout@v4
+        with:
+          repository: RicheyWorks/SmokeHouse
+          path: SmokeHouse
+
+      - name: Check out SuperBeefSort (sibling, nested composite)
+        uses: actions/checkout@v4
+        with:
+          repository: RicheyWorks/SuperBeefSort
+          path: SuperBeefSort
+
+      - name: Check out CSRBT (sibling, nested composite)
+        uses: actions/checkout@v4
+        with:
+          repository: RicheyWorks/CSRBT
+          path: CSRBT
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build and test
+        working-directory: Twine
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon --stacktrace
