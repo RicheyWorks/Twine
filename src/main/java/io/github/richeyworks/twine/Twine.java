@@ -48,19 +48,33 @@ import java.util.zip.CheckedOutputStream;
  */
 public final class Twine<K, V> {
 
+    /** A last-writer-wins put target — the replay-idempotency contract, as a type. */
+    @FunctionalInterface
+    public interface PutSink<K, V> {
+        void put(K key, V value) throws IOException;
+    }
+
+    /** A delete target whose delete-of-absent is a no-op — same contract. */
+    @FunctionalInterface
+    public interface DeleteSink<K> {
+        void delete(K key) throws IOException;
+    }
+
     private static final String JOURNAL = "batch.twine";
     private static final String TMP = "batch.twine.tmp";
     private static final byte OP_PUT = 1;
     private static final byte OP_DELETE = 2;
 
-    private final SmokeHouse<K, V> store;
+    private final PutSink<K, V> putSink;
+    private final DeleteSink<K> deleteSink;
     private final Path journalDir;
     private final SpillSerializer<K> keySerializer;
     private final SpillSerializer<V> valueSerializer;
 
-    private Twine(SmokeHouse<K, V> store, Path journalDir,
+    private Twine(PutSink<K, V> putSink, DeleteSink<K> deleteSink, Path journalDir,
                   SpillSerializer<K> keySerializer, SpillSerializer<V> valueSerializer) {
-        this.store = store;
+        this.putSink = putSink;
+        this.deleteSink = deleteSink;
         this.journalDir = journalDir;
         this.keySerializer = keySerializer;
         this.valueSerializer = valueSerializer;
@@ -76,8 +90,26 @@ public final class Twine<K, V> {
                                           SpillSerializer<V> valueSerializer)
             throws IOException {
         Objects.requireNonNull(store, "store");
+        return over(store::put, store::delete, journalDir, keySerializer, valueSerializer);
+    }
+
+    /**
+     * Tie Twine over any last-writer-wins write target — the seam named by its first
+     * consumer (WholeHog): an {@code IndexedStore} routes writes through its index fan-out,
+     * so batches over an indexed store tie through {@code indexed::put}/{@code indexed::delete}
+     * rather than the primary (which would bypass every secondary). The sinks must be
+     * last-writer-wins upserts with no-op deletes-of-absent — that contract is what makes
+     * replay idempotent, and it is the caller's to keep.
+     */
+    public static <K, V> Twine<K, V> over(PutSink<K, V> putSink, DeleteSink<K> deleteSink,
+                                          Path journalDir,
+                                          SpillSerializer<K> keySerializer,
+                                          SpillSerializer<V> valueSerializer)
+            throws IOException {
         Files.createDirectories(Objects.requireNonNull(journalDir, "journalDir"));
-        Twine<K, V> twine = new Twine<>(store,
+        Twine<K, V> twine = new Twine<>(
+                Objects.requireNonNull(putSink, "putSink"),
+                Objects.requireNonNull(deleteSink, "deleteSink"),
                 journalDir, Objects.requireNonNull(keySerializer, "keySerializer"),
                 Objects.requireNonNull(valueSerializer, "valueSerializer"));
         Files.deleteIfExists(journalDir.resolve(TMP));         // torn = never happened
@@ -160,9 +192,9 @@ public final class Twine<K, V> {
     private void apply(List<Op<K, V>> ops) throws IOException {
         for (Op<K, V> op : ops) {
             if (op.type() == OP_PUT) {
-                store.put(op.key(), op.value());
+                putSink.put(op.key(), op.value());
             } else {
-                store.delete(op.key());
+                deleteSink.delete(op.key());
             }
         }
     }
