@@ -61,6 +61,8 @@ composite builds:
 | [SmokeSignal](https://github.com/RicheyWorks/SmokeSignal) | the wire — a loopback protocol face for the store |
 | [Jerky](https://github.com/RicheyWorks/Jerky) | cold storage — compressed, CRC-verified backup archives |
 | [WholeHog](https://github.com/RicheyWorks/WholeHog) | the integration organism — all of them, at once |
+| [Rub](https://github.com/RicheyWorks/Rub) | the observability engine — tail meter + store gauge, fused into vitals |
+| [Sizzle](https://github.com/RicheyWorks/Sizzle) | the chaos engine — deterministic fault injection at the write seam |
 
 ## Build
 
