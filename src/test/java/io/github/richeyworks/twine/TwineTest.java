@@ -111,6 +111,44 @@ class TwineTest {
     }
 
     @Test
+    void concurrentBatchesSerializeOnTheTwineItself(@TempDir Path dir, @TempDir Path jdir)
+            throws Exception {
+        // Ninth-pass finding 2: commit used to synchronize on the one-shot Batch object, so
+        // two threads committing separate batches raced the shared journal path. Now they
+        // serialize on the Twine — every batch lands, whole, in some order.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            Twine<Long, String> twine = tie(store, jdir);
+            int threads = 4, batchesEach = 15;
+            java.util.concurrent.ExecutorService pool =
+                    java.util.concurrent.Executors.newFixedThreadPool(threads);
+            java.util.List<java.util.concurrent.Future<?>> work = new java.util.ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final long base = t * 1_000L;
+                work.add(pool.submit(() -> {
+                    for (int b = 0; b < batchesEach; b++) {
+                        twine.batch()
+                                .put(base + b * 2, "a" + b)
+                                .put(base + b * 2 + 1, "b" + b)
+                                .commit();
+                    }
+                    return null;
+                }));
+            }
+            for (var w : work) {
+                w.get(30, java.util.concurrent.TimeUnit.SECONDS);   // surfaces any race loudly
+            }
+            pool.shutdown();
+            assertEquals(threads * batchesEach * 2, store.size(),
+                    "every op of every concurrent batch landed exactly once");
+            assertEquals(threads * batchesEach, twine.stats().batchesCommitted(),
+                    "and every batch is on the meter");
+            try (var listing = Files.list(jdir)) {
+                assertEquals(0, listing.count(), "no journal or tmp left behind");
+            }
+        }
+    }
+
+    @Test
     void aTornTmpLandsNothing(@TempDir Path dir, @TempDir Path jdir) throws IOException {
         Files.createDirectories(jdir);
         Files.write(jdir.resolve("batch.twine.tmp"), new byte[]{1, 2, 3});   // torn pre-commit

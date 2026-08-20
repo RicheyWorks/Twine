@@ -174,8 +174,24 @@ public final class Twine<K, V> {
             return this;
         }
 
-        /** Journal → fsync → atomic move (the commit point) → apply → delete journal. */
-        public synchronized void commit() throws IOException {
+        /**
+         * Journal → fsync → atomic move (the commit point) → apply → delete journal.
+         *
+         * <p>Ninth-pass finding 2 (2026-08-20): this used to be {@code synchronized} on the
+         * Batch — a one-shot object nothing else ever locks, so the "one batch at a time"
+         * discipline was documentation, not enforcement, and two threads committing separate
+         * batches raced the shared {@code batch.twine.tmp} path. Commit now serializes on the
+         * Twine itself: the single-writer discipline the class always claimed, made true by
+         * construction. Callers that synchronized externally (WholeHog's wire batch route)
+         * keep working — the lock is reentrant-compatible with theirs being redundant.</p>
+         */
+        public void commit() throws IOException {
+            synchronized (Twine.this) {
+                commitLocked();
+            }
+        }
+
+        private void commitLocked() throws IOException {
             requireStaging();
             committed = true;
             if (ops.isEmpty()) {
