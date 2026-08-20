@@ -71,6 +71,34 @@ public final class Twine<K, V> {
     private final SpillSerializer<K> keySerializer;
     private final SpillSerializer<V> valueSerializer;
 
+    // The batcher's meter (2026-08-20) — the last engine joins the observability story.
+    private final java.util.concurrent.atomic.AtomicLong batchesCommitted =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong opsApplied =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong journalReplays =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * A point-in-time readout of this Twine's work: batches committed through
+     * {@code Batch.commit()}, ops applied to the sinks (commit-path and replay-path both), and journals replayed at
+     * {@link #over construction} — the crash-recovery events, on the meter. A nonzero
+     * {@code journalReplays} is the observable trace of a crash that the exactly-once contract
+     * absorbed.
+     */
+    public record TwineStats(long batchesCommitted, long opsApplied, long journalReplays) {
+        /** A one-line readout, {@link java.util.Locale#ROOT}-pinned like every house line. */
+        public String line() {
+            return String.format(java.util.Locale.ROOT,
+                    "batches=%d ops=%d replays=%d", batchesCommitted, opsApplied, journalReplays);
+        }
+    }
+
+    /** A snapshot of the batcher's own meter. */
+    public TwineStats stats() {
+        return new TwineStats(batchesCommitted.get(), opsApplied.get(), journalReplays.get());
+    }
+
     private Twine(PutSink<K, V> putSink, DeleteSink<K> deleteSink, Path journalDir,
                   SpillSerializer<K> keySerializer, SpillSerializer<V> valueSerializer) {
         this.putSink = putSink;
@@ -117,6 +145,7 @@ public final class Twine<K, V> {
         if (Files.exists(journal)) {
             twine.apply(twine.read(journal));                  // committed = inevitable
             Files.delete(journal);
+            twine.journalReplays.incrementAndGet();            // the crash, on the meter
         }
         return twine;
     }
@@ -178,6 +207,7 @@ public final class Twine<K, V> {
             Files.move(tmp, journal, StandardCopyOption.ATOMIC_MOVE);   // THE commit point
             apply(ops);
             Files.delete(journal);
+            batchesCommitted.incrementAndGet();
         }
 
         private void requireStaging() {
@@ -196,6 +226,7 @@ public final class Twine<K, V> {
             } else {
                 deleteSink.delete(op.key());
             }
+            opsApplied.incrementAndGet();
         }
     }
 

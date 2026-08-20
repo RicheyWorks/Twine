@@ -68,6 +68,17 @@ class TwineTest {
             assertEquals(Map.of(10L, "ten", 20L, "twenty"), scan(store),
                     "replay completes the batch; re-applied ops are harmless");
             assertTrue(twine.batch() != null);
+            // The crash, on the meter (2026-08-20): a replay is the observable trace of the
+            // absorbed crash — and replayed ops count as applied, because they were.
+            assertEquals(1, twine.stats().journalReplays(), "the replay is on the meter");
+            assertEquals(3, twine.stats().opsApplied(), "replayed ops count as applied");
+            assertEquals(0, twine.stats().batchesCommitted(), "a replay is not a new commit");
+
+            // And a clean commit meters as one.
+            twine.batch().put(1L, "one").commit();
+            assertEquals(1, twine.stats().batchesCommitted());
+            assertEquals(4, twine.stats().opsApplied());
+            assertTrue(twine.stats().line().contains("replays=1"), "the line renders");
             try (var listing = Files.list(jdir)) {
                 assertEquals(0, listing.count(), "journal consumed");
             }
