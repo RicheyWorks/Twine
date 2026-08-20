@@ -16,7 +16,7 @@ tasks.withType<JavaCompile>().configureEach {
 }
 
 dependencies {
-    api("io.github.richeyworks:smokehouse:0.1.0")
+    api("io.github.richeyworks:smokehouse:0.2.0")
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
