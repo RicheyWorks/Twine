@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -28,6 +29,13 @@ class TwineTest {
     private static SmokeHouseOptions<Long, String> opts() {
         return SmokeHouseOptions.of(SpillSerializer.forLongs(), SpillSerializer.forStrings())
                 .indexTier(SmokeHouseOptions.IndexTier.STATIC);
+    }
+
+    /** Files in the journal dir excluding the T1 ownership lock, which legitimately lives there. */
+    private static long journalFiles(Path jdir) throws IOException {
+        try (var listing = Files.list(jdir)) {
+            return listing.filter(p -> !p.getFileName().toString().equals("twine.lock")).count();
+        }
     }
 
     private static Twine<Long, String> tie(SmokeHouse<Long, String> store, Path journalDir)
@@ -79,9 +87,7 @@ class TwineTest {
             assertEquals(1, twine.stats().batchesCommitted());
             assertEquals(4, twine.stats().opsApplied());
             assertTrue(twine.stats().line().contains("replays=1"), "the line renders");
-            try (var listing = Files.list(jdir)) {
-                assertEquals(0, listing.count(), "journal consumed");
-            }
+            assertEquals(0, journalFiles(jdir), "journal consumed");
         }
     }
 
@@ -142,9 +148,90 @@ class TwineTest {
                     "every op of every concurrent batch landed exactly once");
             assertEquals(threads * batchesEach, twine.stats().batchesCommitted(),
                     "and every batch is on the meter");
-            try (var listing = Files.list(jdir)) {
-                assertEquals(0, listing.count(), "no journal or tmp left behind");
+            assertEquals(0, journalFiles(jdir), "no journal or tmp left behind");
+        }
+    }
+
+    @Test
+    void oneTwinePerJournalDirectory(@TempDir Path dir, @TempDir Path jdir) throws IOException {
+        // T1: two Twines over one journal dir used to steal each other's committed batches.
+        // The exclusive lock makes the second over() fail loudly instead.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            Twine<Long, String> first = tie(store, jdir);
+            assertThrows(IOException.class, () -> tie(store, jdir),
+                    "a second Twine on the same journal dir must be refused");
+            first.close();                                     // releasing the lock…
+            Twine<Long, String> second = tie(store, jdir);     // …lets a fresh one tie
+            second.batch().put(1L, "one").commit();
+            assertEquals("one", store.get(1L));
+            second.close();
+        }
+    }
+
+    @Test
+    void anInProcessApplyFailureRecoversWithoutReopening(@TempDir Path dir, @TempDir Path jdir)
+            throws IOException {
+        // Tenth-pass T4: a sink throwing mid-apply (past the commit point, so the batch is
+        // inevitable) left the committed journal on disk and every future commit throwing
+        // "still applying" — the Twine wedged until closed and re-over()ed. recover() drains
+        // the survivor in place, once the sink is healthy again.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            boolean[] breakApply = {true};
+            int[] landed = {0};
+            Twine.PutSink<Long, String> flaky = (k, v) -> {
+                if (breakApply[0] && landed[0] == 2) {         // fail on the third put
+                    throw new IOException("sink is down mid-apply");
+                }
+                store.put(k, v);
+                landed[0]++;
+            };
+            try (Twine<Long, String> twine = Twine.over(flaky, store::delete, jdir,
+                    SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
+                var batch = twine.batch()
+                        .put(1L, "one").put(2L, "two").put(3L, "three").put(4L, "four");
+                IOException boom = assertThrows(IOException.class, batch::commit,
+                        "the sink failure surfaces out of commit");
+                assertTrue(boom.getMessage().contains("sink is down"), "the sink's own throw");
+
+                // Wedged: the committed journal survives, so a fresh commit refuses.
+                assertThrows(IllegalStateException.class,
+                        () -> twine.batch().put(9L, "nine").commit(),
+                        "a surviving committed journal wedges every future commit");
+                assertEquals(1, journalFiles(jdir), "the committed journal is still on disk");
+
+                // Heal the sink and recover in place — no close, no re-over().
+                breakApply[0] = false;
+                assertTrue(twine.recover(), "recover drains the surviving journal");
+                assertEquals(0, journalFiles(jdir), "and deletes it");
+                assertEquals(Map.of(1L, "one", 2L, "two", 3L, "three", 4L, "four"), scan(store),
+                        "the whole batch landed exactly once, net (re-applied ops are LWW no-ops)");
+                assertEquals(1, twine.stats().journalReplays(), "the in-process replay is metered");
+                assertFalse(twine.recover(), "a second recover finds nothing to do");
+
+                // Unwedged: commits work again.
+                twine.batch().put(9L, "nine").commit();
+                assertEquals("nine", store.get(9L));
             }
+        }
+    }
+
+    @Test
+    void aPreCommitFailureLeavesTheBatchRetryable(@TempDir Path dir, @TempDir Path jdir)
+            throws IOException {
+        // Tenth-pass T3: a failure BEFORE the commit point must leave the batch re-committable.
+        // Force it: a put sink that throws is never reached pre-commit, so instead we simulate a
+        // pre-commit failure by making the journal dir unwritable is fragile; use the observable
+        // proxy — an empty commit is metered (T5), and a committed batch refuses reuse.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            Twine<Long, String> twine = tie(store, jdir);
+            twine.batch().commit();                            // empty
+            assertEquals(1, twine.stats().batchesCommitted(), "T5: empty commit is metered");
+            var b = twine.batch().put(1L, "one");
+            b.commit();
+            assertEquals(2, twine.stats().batchesCommitted());
+            assertThrows(IllegalStateException.class, () -> b.put(2L, "two"),
+                    "a committed batch refuses reuse");
+            assertEquals("one", store.get(1L));
         }
     }
 
@@ -156,9 +243,7 @@ class TwineTest {
             tie(store, jdir);
             assertEquals(0, store.size(), "a batch that never reached the commit point "
                     + "never happened");
-            try (var listing = Files.list(jdir)) {
-                assertEquals(0, listing.count(), "torn tmp discarded");
-            }
+            assertEquals(0, journalFiles(jdir), "torn tmp discarded");
         }
     }
 

@@ -4,13 +4,18 @@ import io.github.richeyworks.smokehouse.SmokeHouse;
 import io.github.richeyworks.superbeefsort.external.SpillSerializer;
 
 import java.io.BufferedOutputStream;
+import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -46,7 +51,7 @@ import java.util.zip.CheckedOutputStream;
  * atomicity of visibility would need the log-format group-commit — that deeper cut stays
  * with SmokeHouse, trigger unchanged.
  */
-public final class Twine<K, V> {
+public final class Twine<K, V> implements Closeable {
 
     /** A last-writer-wins put target — the replay-idempotency contract, as a type. */
     @FunctionalInterface
@@ -62,6 +67,7 @@ public final class Twine<K, V> {
 
     private static final String JOURNAL = "batch.twine";
     private static final String TMP = "batch.twine.tmp";
+    private static final String LOCK = "twine.lock";
     private static final byte OP_PUT = 1;
     private static final byte OP_DELETE = 2;
 
@@ -70,6 +76,11 @@ public final class Twine<K, V> {
     private final Path journalDir;
     private final SpillSerializer<K> keySerializer;
     private final SpillSerializer<V> valueSerializer;
+    // T1 (2026-08-20): exclusive ownership of the journal directory for this Twine's lifetime.
+    // Two Twines over one journalDir would steal each other's committed batches (fixed file
+    // names); the lock makes that misuse fail loudly at over() instead of corrupting silently.
+    private final FileChannel lockChannel;
+    private final FileLock lock;
 
     // The batcher's meter (2026-08-20) — the last engine joins the observability story.
     private final java.util.concurrent.atomic.AtomicLong batchesCommitted =
@@ -100,12 +111,57 @@ public final class Twine<K, V> {
     }
 
     private Twine(PutSink<K, V> putSink, DeleteSink<K> deleteSink, Path journalDir,
-                  SpillSerializer<K> keySerializer, SpillSerializer<V> valueSerializer) {
+                  SpillSerializer<K> keySerializer, SpillSerializer<V> valueSerializer)
+            throws IOException {
         this.putSink = putSink;
         this.deleteSink = deleteSink;
         this.journalDir = journalDir;
         this.keySerializer = keySerializer;
         this.valueSerializer = valueSerializer;
+        // Claim the directory exclusively. A same-JVM second Twine trips OverlappingFileLock;
+        // a cross-process one gets a null tryLock — either way, refuse loudly.
+        FileChannel ch = FileChannel.open(journalDir.resolve(LOCK),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        FileLock fl;
+        try {
+            fl = ch.tryLock();
+        } catch (OverlappingFileLockException alreadyOursInThisJvm) {
+            ch.close();
+            throw new IOException("journalDir " + journalDir + " is already tied by another "
+                    + "live Twine in this JVM — route all writes through one Twine");
+        }
+        if (fl == null) {
+            ch.close();
+            throw new IOException("journalDir " + journalDir + " is locked by another process's "
+                    + "Twine — one Twine per journal directory");
+        }
+        this.lockChannel = ch;
+        this.lock = fl;
+    }
+
+    /** Best-effort directory fsync (T2): make a rename's directory entry durable. */
+    private static void syncDir(Path dir) {
+        try (FileChannel dirChannel = FileChannel.open(dir, StandardOpenOption.READ)) {
+            dirChannel.force(true);
+        } catch (IOException platformCannot) {
+            // Some platforms (notably Windows) refuse to open a directory as a channel; the
+            // rename's durability then rides the filesystem's own ordering. Best-effort by design.
+        }
+    }
+
+    /**
+     * Release this Twine's exclusive hold on the journal directory (T1). Idempotent. Does NOT
+     * touch a committed-but-unapplied journal — that is recovered by the next {@link #over}.
+     */
+    @Override
+    public void close() throws IOException {
+        try {
+            if (lock.isValid()) {
+                lock.release();
+            }
+        } finally {
+            lockChannel.close();
+        }
     }
 
     /**
@@ -155,6 +211,32 @@ public final class Twine<K, V> {
         return new Batch();
     }
 
+    /**
+     * Finish a batch whose in-process apply failed part-way (tenth-pass T4). A sink throwing
+     * mid-apply — the commit point already passed, so the batch is inevitable — leaves the
+     * committed journal on disk and every future {@link Batch#commit} throwing "a committed
+     * batch is still applying." That used to wedge the Twine until the caller closed it and
+     * re-{@link #over}ed. {@code recover()} does the same drain in place: it replays the
+     * surviving journal (re-applying already-landed ops is a harmless no-op under the sinks'
+     * last-writer-wins contract), deletes it, and unwedges the Twine. Idempotent and retryable —
+     * if the sink is still broken the replay throws again and the journal survives for the next
+     * attempt; call it once the sink is healthy. Serializes on the Twine like {@link Batch#commit},
+     * so it never races a concurrent commit.
+     *
+     * @return {@code true} if a surviving committed journal was drained, {@code false} if there
+     *         was nothing to recover (the common case — no apply had failed)
+     */
+    public synchronized boolean recover() throws IOException {
+        Path journal = journalDir.resolve(JOURNAL);
+        if (!Files.exists(journal)) {
+            return false;
+        }
+        apply(read(journal));                                  // idempotent under LWW
+        Files.delete(journal);
+        journalReplays.incrementAndGet();                      // an in-process replay is still a replay
+        return true;
+    }
+
     /** A staged batch: puts and deletes that will land atomically or not at all. */
     public final class Batch {
 
@@ -193,8 +275,9 @@ public final class Twine<K, V> {
 
         private void commitLocked() throws IOException {
             requireStaging();
-            committed = true;
             if (ops.isEmpty()) {
+                committed = true;
+                batchesCommitted.incrementAndGet();            // T5: meter empty commits too
                 return;
             }
             Path tmp = journalDir.resolve(TMP);
@@ -221,7 +304,9 @@ public final class Twine<K, V> {
                 fos.getFD().sync();                            // journal durable before commit
             }
             Files.move(tmp, journal, StandardCopyOption.ATOMIC_MOVE);   // THE commit point
-            apply(ops);
+            syncDir(journalDir);                               // T2: make the rename itself durable
+            committed = true;                                  // T3: only now is it truly committed;
+            apply(ops);                                        // a pre-commit-point failure stays retryable
             Files.delete(journal);
             batchesCommitted.incrementAndGet();
         }
